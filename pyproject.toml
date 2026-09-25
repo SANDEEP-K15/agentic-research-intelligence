@@ -1,0 +1,17 @@
+[project]
+name = "research-intelligence-agent"
+version = "1.0.0"
+description = "Research Intelligence Agent take-home assignment"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10",
+    "google-genai>=1.39",
+    "ddgs>=9.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
