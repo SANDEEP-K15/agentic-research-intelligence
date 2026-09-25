@@ -1,170 +1,236 @@
-# Research Intelligence Agent
+# Agentic Research Intelligence System
 
-A command-line **agentic research workflow** (take-home implementation per `PRD.md`). You give a natural-language goal; the system analyzes it, prints a plan, runs that plan with tools, recovers from retryable failures, and produces a structured `ResearchReport` with findings, sources, limitations, and status.
+Python CLI agent that accepts a high-level research goal, plans and executes a fixed research pipeline with registered tools, recovers from retryable failures, and returns a structured `ResearchReport` with trace, findings, sources, and status.
 
-The LLM (Gemini) proposes structured goal analysis, plan text, and synthesis drafts. **Python** owns validation, tool calls, retries, page-evidence fetch, candidate selection, citation grounding, and final status. No LangChain/LangGraph/CrewAI.
+## Overview
 
-## Problem and use case
+Researchers often start with an underspecified question—*what mattered in generative AI last week?*—and need a **sourced brief**, not an unstructured chat reply. This system turns a **natural-language goal** into a **validated, stepwise workflow**: structured goal analysis, a printed plan, sequential execution with visible trace lines, tool calls through a registry, evidence processing over search results, and a final report whose citations are checked against retrieved URLs.
 
-Turn requests like *“Research the top 3 developments in generative AI from the last week”* into a **traceable, sourced brief**. The topic and time window come from the user’s wording (not hard-coded). The same pipeline works for robotics, cybersecurity, cloud computing, and similar goals.
+The implementation is a **custom agentic pipeline** (no LangChain/LangGraph/CrewAI) built for an **AI engineering take-home assignment** (`PRD.md`). The LLM (Gemini) fills Pydantic schemas for analysis, planning, and synthesis; **Python** owns orchestration, tool I/O, retries, selection heuristics, and grounding.
+
+## Key Capabilities
+
+- **Natural-language goal analysis** — `GoalAnalyzer` extracts topic, time range, recency, requested item count, and output type.
+- **Multi-step planning** — LLM `PlanDraft`, then `canonicalize_plan` enforces the execution contract.
+- **Structured Gemini outputs** — `generate_structured` with JSON schema validation and bounded LLM retries (`LLM_MAX_RETRIES`).
+- **Web search** — `ddgs` (default backend `duckduckgo`), up to five queries for time-bounded goals.
+- **Calculator** — Safe `ast`-based arithmetic (no `eval`).
+- **Tool registry** — `register`, `get`, `list_tools`; engine resolves tools only through the registry.
+- **Research normalization** — Dedupe by URL/title; optional HTML fetch for promising URLs.
+- **Candidate selection** — Topic, recency, event-language, and source heuristics; may return fewer than requested.
+- **Page-level evidence** — Meta/JSON-LD/`<time>` dates and text excerpt for validation and synthesis context.
+- **Failure simulation** — `--simulate-failure` raises `SimulatedTimeoutError` on the first search call.
+- **Retry/recovery** — `RecoveryManager` with configurable `MAX_RETRIES` for retryable search errors.
+- **Evidence-aware synthesis** — `ground_findings` drops citations not in the shortlist.
+- **Structured final reports** — `ResearchReport` with `success` | `partial` | `failed`, execution summary, limitations.
+- **CLI** — `python -m app`, optional `--output`, `--verbose`.
+- **Automated tests** — Pytest with fakes/mocks (no live Gemini or DuckDuckGo in CI).
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    CLI["CLI"] --> Goal["Goal Analysis"]
-    Goal --> Planner["Planner"]
-    Planner --> Engine["Execution Engine"]
-    Engine --> Registry["Tool Registry"]
-    Registry --> Search["Web Search"]
-    Registry --> Calculator["Calculator"]
-    Engine --> Recovery["Recovery Manager"]
-    Engine --> Synthesis["Synthesis"]
-    Synthesis --> Report["Structured Report"]
+    U["User goal"] --> CLI["CLI"]
+    CLI --> AC["Agent Controller"]
+    AC --> GA["Goal Analyzer"]
+    GA --> PL["Planner"]
+    PL --> EE["Execution Engine"]
+    EE --> TR["Tool Registry"]
+    TR --> WS["Web Search"]
+    TR --> CALC["Calculator"]
+    EE --> REP["Research / Evidence Processing<br/>normalize · select · synthesize"]
+    EE --> RM["Recovery Manager<br/>wraps retryable tool calls"]
+    REP --> RG["Report / Structured Output"]
+    RM --> EE
+    GA -.-> LLM["Gemini LLM"]
+    PL -.-> LLM
+    REP -.-> LLM
 ```
 
-Module-level detail, sequence diagrams, and responsibility table: [docs/architecture.md](docs/architecture.md).  
-One-page design notes: [docs/design-writeup.md](docs/design-writeup.md).
+Recovery runs **inside** the execution engine around individual tool operations (especially `web_search`); it is not a separate post-pipeline stage. Gemini is accessed via `LLMClient`, not the tool registry.
+
+### CLI
+
+`app/cli.py` parses the goal and flags (`--simulate-failure`, `--output`, `--verbose`), loads settings (including optional `.env`), builds the LLM and registry, and runs `AgentController`. Exit code `0` only when `report.status == "success"`; `partial`/`failed` return `1`; missing API key returns `2`.
+
+### Agent Controller
+
+`app/controller.py` sequences goal analysis → planning → `ExecutionEngine.execute` → `build_report`, emitting trace sections for goal, plan, steps, and report.
+
+### Goal Analyzer
+
+`app/analysis/goal.py` calls Gemini with a fixed system prompt and returns `GoalAnalysis` (topic, `time_range`, `recency`, `requested_items`, `output_type`).
+
+### Planner
+
+`app/planning/planner.py` produces a `PlanDraft`, then `canonicalize_plan` reorders and fills steps to match `REQUIRED_TOOLS`: `web_search`, `normalize`, `select`, `calculator`, `synthesize`. Plan adjustments are recorded in report limitations when the draft differed.
+
+### Execution Engine
+
+`app/execution/engine.py` runs plan steps sequentially. Registry tools (`web_search`, `calculator`) go through recovery; stages (`normalize`, `select`, `synthesize`) run in-process. Critical step failure aborts later steps (`skipped`). Multi-query search merges results into `context.search_results`.
+
+### Tool Registry
+
+`app/tools/registry.py` holds named tools. The engine never imports search or calculator implementations directly at call sites.
+
+### Web Search
+
+`app/tools/web_search.py` wraps `DDGS().text()` with region, safesearch, `max_results`, `timelimit`, and backend. Results normalize to `SearchResult` (title, url, snippet, domain). Empty or unusable provider responses raise `EmptySearchError`. Optional `FailureSimulator` on first invocation.
+
+### Calculator
+
+`app/tools/calculator.py` evaluates a single arithmetic expression from the engine (source-diversity formula). Invalid or unsafe expressions raise `CalculatorError` (not retried by recovery).
+
+### Recovery Manager
+
+`app/execution/recovery.py` retries operations when `is_retryable_tool_error` is true: `SimulatedToolError` and `SearchNetworkError` (including `EmptySearchError`). Stops after `max_retries` and raises `RecoveryExhausted` with the original exception preserved.
+
+### Report Generation
+
+`app/report/builder.py` assembles `ResearchReport`: plan, per-step `StepSummary`, tools used, retry counts, findings, sources, limitations, and status. `write_report` optionally writes JSON via `--output`.
+
+## Agent Workflow
+
+1. User submits a research goal on the CLI.
+2. **Goal Analyzer** returns structured requirements (`GoalAnalysis`).
+3. **Planner** returns a five-step plan aligned to the required tool order (possibly adjusted from the LLM draft).
+4. **Execution Engine** runs each step and prints `[STEP i/5]` trace lines.
+5. **Web search** runs up to five focused queries (when recency is set), each with an appropriate `timelimit`, and aggregates `SearchResult` rows.
+6. **Normalize** (`prepare_candidates`) deduplicates results and fetches HTML evidence for promising URLs (`page_title`, `publication_date`, `page_excerpt`).
+7. **Select** (`select_candidates`) applies disqualification and scoring; zero qualifiers raise `PipelineError` (failed run, no fabricated findings).
+8. **Calculator** computes `(unique domains / normalized count) × 100` as a descriptive diversity statistic.
+9. **Synthesize** calls Gemini with shortlist context; **grounding** removes findings whose URLs were not retrieved.
+10. **Report** is printed to the terminal and optionally saved as JSON; CLI exit code reflects `success` vs `partial`/`failed`.
+
+## Tooling
+
+| Tool | Purpose | Why it exists |
+|------|---------|---------------|
+| Web Search | Retrieve external research sources via `ddgs` | Supplies live public URLs, titles, and snippets for the pipeline |
+| Calculator | Evaluate a deterministic arithmetic expression | Performs numeric work without LLM arithmetic; satisfies multi-tool requirement |
+| Gemini (`google-genai`) | Goal analysis, planning, synthesis | Handles language understanding and prose generation under Pydantic schemas |
+
+Registry tools: **Web Search** and **Calculator** only. Gemini is wired through `LLMClient` in analysis, planning, and synthesis.
+
+## Reliability & Failure Recovery
+
+**Detection** — Tool and stage failures surface as exceptions; the engine records `StepSummary` with `error` text and emits `[ERROR]` lines. Synthesis failures include the underlying type and message via `_public_error`.
+
+**Bounded retries** — `RecoveryManager` allows at most `MAX_RETRIES` (default `2`) additional attempts per recovered operation. Retry count is aggregated on the report.
+
+**Empty search** — `EmptySearchError` subclasses `SearchNetworkError` and is **retryable**. `WebSearchTool` also raises `EmptySearchError` when normalization yields zero usable rows, so an empty provider response is **not** treated as success.
+
+**Simulated failure** — With `--simulate-failure`, the first `web_search` `run` raises `SimulatedTimeoutError` before the network; the next attempt uses the real search function.
+
+**Insufficient evidence** — If `select_candidates` returns nobody, the select stage fails with `PipelineError`; later steps are skipped. The report status is `failed` with no findings rather than invented results. Fewer grounded findings than requested yields `partial` and explicit limitations.
+
+**Non-retryable** — Default recovery does not retry `CalculatorError`, `SearchProviderError`, `MalformedSearchError`, `ToolInputError`, or `PipelineError`. LLM schema failures use a separate retry path inside `GeminiLLM` (`LLM_MAX_RETRIES`), then fail the run.
+
+**Chained errors** — `RecoveryExhausted` and trace output retain the original exception (`exc.original` / `__cause__` where applicable).
+
+This is assignment-scoped error handling, not a claim of production-grade fault tolerance.
+
+## Evidence Handling
+
+Pipeline (implemented in `app/research/`):
 
 ```text
-CLI → AgentController
-        → GoalAnalyzer (Gemini → GoalAnalysis)
-        → Planner (Gemini → Plan, canonicalized to 5 steps)
-        → ExecutionEngine
-              → RecoveryManager (bounded retries)
-              → ToolRegistry → web_search | calculator
-              → research stages: normalize → select → synthesize
-        → Report builder → terminal + optional JSON
+Search (multiple queries)
+  → Deduplicate (URL + title)
+  → Normalize / prepare_candidates
+  → Fetch promising pages (HTTP, capped bytes)
+  → Extract publication metadata + excerpt
+  → Score / select candidates (topic, recency, event, source)
+  → Synthesize with shortlist-only URLs
+  → Ground findings (drop uncited URLs)
 ```
 
-## Agent workflow
+**Dates** — `publication_date` from page meta, JSON-LD, or `<time>` is the primary recency signal for scoring and disqualification. **Event-linked** dates (text near verbs such as *announced* / *launched*) are parsed separately; arbitrary historical years in body text are not treated like a fresh publication date. Heuristics can still reject stale event stories or accept nothing when evidence is thin—accuracy is not guaranteed.
 
-1. **Goal analysis** — Extract topic, `time_range`, `recency`, requested count, output type.
-2. **Planning** — LLM draft plan; `canonicalize_plan` enforces: `web_search` → `normalize` → `select` → `calculator` → `synthesize`.
-3. **Execution** — Visible trace: `[GOAL]`, `[PLAN]`, `[STEP i/5]`, `[TOOL]` / `[STAGE]`, `[SUCCESS]` / `[ERROR]` / `[RECOVERY]`, `[REPORT]`.
-4. **Search** — Up to five time-bounded queries per goal; results merged.
-5. **Normalize** — Dedupe URLs/titles; fetch HTML evidence for promising domains (meta dates, excerpt).
-6. **Select** — Heuristic shortlist (topic, recency, event language, source quality); may return fewer than requested.
-7. **Calculator** — Domain diversity percentage over normalized results.
-8. **Synthesize** — LLM findings; URLs not in the shortlist are dropped.
-9. **Report** — `success` | `partial` | `failed` plus limitations.
+**Promising URLs** — Enrichment runs for reputable/primary domains or when topic tokens appear in title/snippet; others remain snippet-only.
 
-## Tools (why these two)
+## Example Execution
 
-| Tool | Implementation | Why |
-| --- | --- | --- |
-| **web_search** | `ddgs` → DuckDuckGo (`SEARCH_BACKEND`, default `duckduckgo`) | Live public evidence for research goals without a paid search API. |
-| **calculator** | `ast` literal evaluation | Deterministic numeric step in the plan; demonstrates a second tool and safe expression evaluation (no `eval`). |
+```bash
+python -m app "Find the top 3 developments in generative AI from last week"
+```
 
-All tools are obtained only through `ToolRegistry`.
+The CLI accepts any natural-language goal; topic and time window are inferred by the goal analyzer. Captured transcripts in `examples/` used the equivalent phrasing *Research the top 3 developments in generative AI from the last week.*
 
-## Failure and recovery
+Failure simulation:
 
-- **`--simulate-failure`** — First `web_search` raises `SimulatedTimeoutError` before the network (PRD failure simulation).
-- **Retryable errors** — Simulated timeout, network/timeout errors, `EmptySearchError` (no usable results). Retried up to **`MAX_RETRIES`** (default 2) via `RecoveryManager`.
-- **Trace** — `[ERROR] <ExceptionName>`, `[RECOVERY] Attempting recovery...`, `[RECOVERY] Retry n/N`, then a repeated `[TOOL] web_search` on success.
-- **Non-retryable** — Invalid tool input, exhausted retries, failed select/synthesis where retry would not help.
+```bash
+python -m app "Research the top 3 developments in generative AI from the last week." --simulate-failure
+```
 
-See [examples/simulate_failure_recovery.md](examples/simulate_failure_recovery.md) for a real capture.
+JSON report:
 
-## Setup and environment variables
+```bash
+python -m app "Research the top 3 developments in generative AI from the last week." --output report.json
+```
 
-Create a virtual environment and install dependencies (Python **3.11+**):
+**Live outcomes** — Saved runs in [`examples/`](examples/) include **`partial`** (one of three findings) and **`failed`** (search succeeded, selection found no qualifying candidates). No live capture in this repo reached **`success`** (three grounded in-window findings); mocked tests assert the full success path.
 
-```powershell
+Abbreviated trace shape:
+
+```text
+[GOAL] …
+[PLAN] …
+[STEP 1/5]
+[TOOL] web_search
+[SUCCESS] N results retrieved from 5 queries
+[STAGE] normalize
+[STAGE] select
+[TOOL] calculator
+[STAGE] synthesize
+[REPORT]
+Status: partial | failed | success
+```
+
+## Installation
+
+Requires **Python 3.11+** (`pyproject.toml`).
+
+```bash
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+# Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
 
-Copy secrets locally (never commit `.env`; it is in `.gitignore`):
+Dependencies: `pydantic`, `google-genai`, `ddgs`, `pytest` (see `requirements.txt`).
+
+## Configuration
 
 | Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `GEMINI_API_KEY` | Yes for live runs | — | Gemini API key |
-| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Model id for `google-genai` |
-| `MAX_RETRIES` | No | `2` | Tool recovery attempts |
-| `LLM_MAX_RETRIES` | No | `2` | Retries on invalid structured LLM JSON |
-| `SEARCH_MAX_RESULTS` | No | `8` | Max rows per query |
-| `SEARCH_BACKEND` | No | `duckduckgo` | `ddgs` backend name |
+|----------|----------|---------|---------|
+| `GEMINI_API_KEY` | Yes (live runs) | — | Gemini API access |
+| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Model id |
+| `MAX_RETRIES` | No | `2` | Tool recovery budget |
+| `LLM_MAX_RETRIES` | No | `2` | Structured-output retries |
+| `SEARCH_MAX_RESULTS` | No | `8` | Per-query result cap |
+| `SEARCH_BACKEND` | No | `duckduckgo` | `ddgs` backend (`auto` fallback on empty) |
 
-PowerShell:
-
-```powershell
-$env:GEMINI_API_KEY = "your-key"
-```
-
-Optional `.env` in the project root is loaded by `app/config.py` if present (existing shell variables take precedence).
-
-## Run commands
-
-```powershell
-python -m app "Research the top 3 developments in generative AI from the last week."
-python -m app "Research the top 3 developments in robotics from the last week."
-python -m app "Research the top 3 developments in generative AI from the last week." --simulate-failure
-python -m app "Research the top 3 developments in generative AI from the last week." --output report.json
-python -m app "..." --verbose
-python -m app --help
-```
-
-### Exit codes
-
-| Code | Meaning |
-| ---: | --- |
-| 0 | Report status `success` |
-| 1 | `partial` or `failed`, or provider error |
-| 2 | Bad CLI args or missing `GEMINI_API_KEY` |
+Optional `.env` in the project root is loaded by `app/config.py` if present. **Do not commit `.env`** (listed in `.gitignore`).
 
 ## Testing
 
-Tests use mocks/fakes—no live Gemini or DuckDuckGo:
-
-```powershell
+```bash
 python -m pytest
 ```
 
-## Sample transcripts
+Tests use scripted LLMs and stubbed search; they do not require network access or API keys for the default suite.
 
-Real terminal captures (not fabricated) live in [examples/](examples/). Summary:
+## Documentation & samples
 
-| File | Status | Notes |
-| --- | --- | --- |
-| [partial_run_generative_ai.md](examples/partial_run_generative_ai.md) | `partial` | Pipeline completed; 1 of 3 findings |
-| [simulate_failure_recovery.md](examples/simulate_failure_recovery.md) | `failed` | Shows simulated timeout + search recovery |
-| [failed_run_insufficient_evidence.md](examples/failed_run_insufficient_evidence.md) | `failed` | Search succeeded; select found no qualifying candidates |
-
-During submission prep, **no live run produced `success`** (three in-window grounded findings). Outcomes depend on search results and selection on the day of the run. Full pipeline success is asserted in `tests/test_cli.py` and related tests with doubles.
+- [docs/architecture.md](docs/architecture.md) — Diagrams and module boundaries  
+- [docs/design-writeup.md](docs/design-writeup.md) — Design rationale and limitations  
+- [examples/](examples/) — Verbatim terminal transcripts (`partial`, `failed`, recovery demo)  
+- [PRD.md](PRD.md) — Assignment specification  
 
 ## Limitations
 
-- Search coverage is whatever `ddgs` returns for five queries; empty or noisy results happen in production.
-- Page evidence is a capped HTML fetch (meta/`time`/JSON-LD dates + text excerpt), not full article extraction.
-- Selection is heuristic (topic overlap, publication and event-linked dates, event verbs, domain lists)—not an objective “top N.”
-- Calculator output is **domain diversity %**, not importance.
-- Gemini free-tier quotas can cause synthesis failures (`429`); the trace reports the underlying error.
-- Grounding removes findings that cite URLs that were not retrieved.
-
-## Design decisions
-
-- **Custom orchestration** instead of agent frameworks so planning, registry, recovery, and report shape stay visible and testable.
-- **Structured outputs** (Pydantic + Gemini JSON schema) for goal, plan, and synthesis; invalid responses retry, then fail closed.
-- **Canonical five-step plan** so the model cannot skip search or synthesis.
-- **Deterministic failure simulation** on search only, for demos and tests.
-- **Citation grounding** so the model cannot invent sources.
-- **`partial` status** when some but not all requested findings are supported—honest reporting vs. padding.
-
-## Project layout
-
-```text
-app/           CLI, controller, analysis, planning, execution, tools, research, report, llm
-docs/          architecture.md, design-writeup.md
-examples/      real run transcripts
-tests/         pytest suite
-PRD.md         assignment specification
-requirements.txt
-pyproject.toml
-```
-
-## License / submission
-
-Built as an engineering take-home. Do not commit API keys or `.env`.
+- Search quality and availability depend on `ddgs` and the public index; intermittent `EmptySearchError` is expected in live use.
+- Page evidence is a partial HTML fetch, not full article extraction or paywall bypass.
+- Selection and date rules are heuristics; strict recency can yield zero candidates despite many search hits.
+- Gemini quota errors (`429`) can fail synthesis; the trace should show the provider error.
+- Calculator output is domain diversity, not relevance or importance.
