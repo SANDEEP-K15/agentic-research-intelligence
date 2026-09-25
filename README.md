@@ -146,7 +146,7 @@ Optional `.env` at the project root is loaded by `app/config.py` (shell env wins
 python -m pytest
 ```
 
-**83** tests collected; uses fakes and mocks—no network or API key required for the default run.
+**83 tests passing**; uses fakes and mocks—no network or API key required for the default run.
 
 ## Project Structure
 
@@ -173,14 +173,14 @@ examples/            Verbatim CLI transcripts
 
 - Visible planner, registry, and recovery instead of a black-box agent framework
 - Canonical five-step plan so search and synthesis cannot be skipped silently
-- Two registry tools plus deterministic calculator step
+- Two registry tools (`web_search`, `calculator`) combined with deterministic in-process research stages
 - Citation grounding on the shortlist only
 - `partial` when fewer findings than requested are supported by evidence
 - Vendor SDKs confined to `app/llm/` and `app/tools/web_search.py`
 
 ## Limitations
 
-- Public search via `ddgs` is noisy; `EmptySearchError` and weak recall happen in production.
+- Public search via `ddgs` is noisy; `EmptySearchError` and weak recall can occur during live runs.
 - Page evidence is partial HTML, not full article parsing or paywall access.
 - Selection and date rules are heuristics; many hits can still yield zero candidates.
 - Gemini quota (`429`) can block synthesis on free tiers.
